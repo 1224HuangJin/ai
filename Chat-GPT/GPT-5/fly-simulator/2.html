@@ -1,0 +1,578 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8" />
+  <title>3D 模拟飞行（单文件｜跑道｜可降落｜多机型｜声音）</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1" />
+  <style>
+    html, body { margin: 0; padding: 0; height: 100%; background: #87b8e5; overflow: hidden; font-family: system-ui, -apple-system, Segoe UI, Roboto, "PingFang SC", "Microsoft YaHei", sans-serif; }
+    #hud, #help, #centerTip {
+      user-select: none; -webkit-user-select: none;
+    }
+    #hud {
+      position: fixed; top: 12px; left: 12px; color: #0a1b2a; background: rgba(255, 255, 255, 0.8);
+      border-radius: 8px; padding: 10px 12px; font-size: 13px; line-height: 1.5; backdrop-filter: blur(4px);
+      box-shadow: 0 4px 14px rgba(0,0,0,0.15);
+    }
+    #hud b { color: #0a1b2a; }
+    #help {
+      position: fixed; right: 12px; bottom: 12px; color: #0a1b2a; background: rgba(255, 255, 255, 0.8);
+      border-radius: 8px; padding: 10px 12px; font-size: 13px; line-height: 1.6; max-width: 360px; backdrop-filter: blur(4px);
+      box-shadow: 0 4px 14px rgba(0,0,0,0.15);
+    }
+    .badge {
+      display: inline-block; padding: 2px 8px; border-radius: 999px; font-weight: 600; font-size: 12px;
+      background: #0a1b2a; color: #fff; letter-spacing: .3px; margin-left: 6px;
+    }
+    #centerTip {
+      position: fixed; left: 50%; top: 50%; transform: translate(-50%, -50%);
+      color: #fff; background: rgba(10,27,42,.45); padding: 10px 14px; border-radius: 8px; font-size: 13px;
+      opacity: 0; transition: opacity .25s ease;
+    }
+    canvas { display: block; }
+  </style>
+</head>
+<body>
+  <div id="hud">
+    <div><b>机型</b>：<span id="planeName">螺旋桨机</span> <span class="badge" id="soundBadge">声音 关</span></div>
+    <div><b>速度</b>：<span id="spd">0</span> km/h <span class="badge" id="thrBadge">油门 0%</span></div>
+    <div><b>高度</b>：<span id="alt">0</span> m ｜ <b>垂速</b>：<span id="vs">0</span> m/s</div>
+    <div><b>姿态</b>：俯仰 <span id="pit">0</span>° ｜ 滚转 <span id="rol">0</span>° ｜ 偏航 <span id="yaw">0</span>°</div>
+    <div><b>起落架</b>：固定 ｜ <b>视角</b>：<span id="viewLabel">第三人称</span></div>
+    <div><b>状态</b>：<span id="state">空中</span></div>
+  </div>
+  <div id="help">
+    <div style="font-weight:700;margin-bottom:6px;">操作</div>
+    <div>W/S：俯仰（机头下 / 上）</div>
+    <div>A/D：滚转（左 / 右）</div>
+    <div>Q/E：偏航（左 / 右）</div>
+    <div>Shift/Ctrl：油门 + / -</div>
+    <div>Space：刹车（接地）</div>
+    <div>V：切换第一/第三人称</div>
+    <div>R：重置位置</div>
+    <div>1/2/3：切换机型（螺旋桨 / 战斗机 / 客机）</div>
+    <div>M：开关声音（任意按键首次触发音频）</div>
+  </div>
+  <div id="centerTip">已重置</div>
+
+  <!-- three.js（CDN 依赖） -->
+  <script src="https://unpkg.com/three@0.158.0/build/three.min.js"></script>
+  <script>
+    // 场景与渲染
+    const scene = new THREE.Scene();
+    scene.background = new THREE.Color(0x87b8e5);
+    scene.fog = new THREE.Fog(0x87b8e5, 400, 4500);
+
+    const camera = new THREE.PerspectiveCamera(70, window.innerWidth / window.innerHeight, 0.05, 20000);
+    camera.position.set(0, 3, 12);
+
+    const renderer = new THREE.WebGLRenderer({ antialias: true, alpha: false });
+    renderer.setSize(window.innerWidth, window.innerHeight);
+    renderer.setPixelRatio(Math.min(2, window.devicePixelRatio));
+    renderer.shadowMap.enabled = true;
+    renderer.shadowMap.type = THREE.PCFSoftShadowMap;
+    renderer.toneMapping = THREE.ACESFilmicToneMapping;
+    renderer.toneMappingExposure = 1.0;
+    if (renderer.outputColorSpace !== undefined) renderer.outputColorSpace = THREE.SRGBColorSpace;
+    document.body.appendChild(renderer.domElement);
+
+    // 光照
+    const hemi = new THREE.HemisphereLight(0xb1e1ff, 0x445566, 1.25);
+    scene.add(hemi);
+    const dirLight = new THREE.DirectionalLight(0xffffff, 1.15);
+    dirLight.position.set(100, 160, -80);
+    dirLight.castShadow = true;
+    dirLight.shadow.mapSize.set(2048, 2048);
+    const s = 180;
+    Object.assign(dirLight.shadow.camera, { left: -s, right: s, top: s, bottom: -s, near: 10, far: 700 });
+    scene.add(dirLight);
+
+    // 地面
+    function makeGrassTexture(size = 1024, cells = 16, c1 = '#8fbd78', c2 = '#78ab66') {
+      const cvs = document.createElement('canvas'); cvs.width = cvs.height = size;
+      const ctx = cvs.getContext('2d'); const step = size / cells;
+      for (let y = 0; y < cells; y++) for (let x = 0; x < cells; x++) {
+        ctx.fillStyle = (x + y) % 2 === 0 ? c1 : c2; ctx.fillRect(x * step, y * step, step, step);
+      }
+      const tex = new THREE.CanvasTexture(cvs);
+      tex.wrapS = tex.wrapT = THREE.RepeatWrapping; tex.repeat.set(120, 120);
+      tex.anisotropy = renderer.capabilities.getMaxAnisotropy?.() || 8;
+      return tex;
+    }
+    const ground = new THREE.Mesh(new THREE.PlaneGeometry(12000, 12000), new THREE.MeshStandardMaterial({ map: makeGrassTexture(), roughness: 1, metalness: 0 }));
+    ground.rotation.x = -Math.PI / 2; ground.receiveShadow = true; ground.name = 'ground';
+    scene.add(ground);
+
+    // 跑道
+    const runway = createRunway();
+    scene.add(runway);
+
+    function createRunway() {
+      const length = 1600, width = 42;
+      const tex = makeRunwayTexture(length, width);
+      const mat = new THREE.MeshStandardMaterial({ map: tex, roughness: 0.9, metalness: 0, color: 0xffffff });
+      const mesh = new THREE.Mesh(new THREE.PlaneGeometry(length, width), mat);
+      mesh.rotation.x = -Math.PI / 2;
+      mesh.position.set(0, 0.01, 0); // 稍微抬起避免闪烁
+      mesh.receiveShadow = true;
+      mesh.userData = { length, width };
+      // 简单的进近灯
+      const lampMat = new THREE.MeshBasicMaterial({ color: 0xfff4b2 });
+      for (let i = -3; i <= 3; i++) {
+        const lamp = new THREE.Mesh(new THREE.CylinderGeometry(0.1, 0.1, 0.6, 8), lampMat);
+        lamp.position.set(-length/2 - 20, 0.3, i * 6);
+        scene.add(lamp);
+      }
+      return mesh;
+    }
+
+    function makeRunwayTexture(length, width) {
+      const pxPerM = 2; // 分辨率
+      const w = Math.round(length * pxPerM), h = Math.round(width * pxPerM);
+      const cvs = document.createElement('canvas'); cvs.width = w; cvs.height = h;
+      const ctx = cvs.getContext('2d');
+
+      // 背景柏油
+      ctx.fillStyle = '#3b3d43'; ctx.fillRect(0, 0, w, h);
+      // 细噪点
+      const noise = ctx.createImageData(w, h);
+      for (let i = 0; i < noise.data.length; i += 4) {
+        const n = 240 + Math.random() * 15;
+        noise.data[i] = n; noise.data[i+1] = n; noise.data[i+2] = n; noise.data[i+3] = 10;
+      }
+      ctx.putImageData(noise, 0, 0);
+
+      ctx.fillStyle = '#ffffff';
+      // 中线虚线
+      const dashW = 30 * pxPerM, gap = 30 * pxPerM, lineW = 2 * pxPerM;
+      const midY = h / 2 - lineW / 2;
+      for (let x = 20 * pxPerM; x < w - 20 * pxPerM; x += dashW + gap) {
+        ctx.fillRect(x, midY, dashW, lineW);
+      }
+      // 两侧边线
+      const edgeW = 0.8 * pxPerM;
+      ctx.fillRect(0, edgeW, w, edgeW);
+      ctx.fillRect(0, h - 2 * edgeW, w, edgeW);
+      // 门槛条
+      const threshCount = 10, barW = 3 * pxPerM, barH = 1.6 * pxPerM, margin = 6 * pxPerM;
+      for (let i = 0; i < threshCount; i++) {
+        const y1 = h/2 - 10*pxPerM - i * (barH + margin);
+        const y2 = h/2 + 10*pxPerM + i * (barH + margin) - barH;
+        ctx.fillRect(8*pxPerM, y1, 14*pxPerM, barH);
+        ctx.fillRect(8*pxPerM, y2, 14*pxPerM, barH);
+      }
+      const tex = new THREE.CanvasTexture(cvs);
+      tex.anisotropy = renderer.capabilities.getMaxAnisotropy?.() || 8;
+      tex.wrapS = tex.wrapT = THREE.ClampToEdgeWrapping;
+      return tex;
+    }
+
+    // 机型配置
+    const PLANE_TYPES = {
+      prop: {
+        name: '螺旋桨机',
+        maxSpeed: 150, minSpeed: 20, accel: 24, drag: 0.001, pitchRate: deg(50), rollRate: deg(85), yawRate: deg(35),
+        propRPMAtFull: 2000, gearClearance: 1.2, spawnAlt: 18, spawnSpd: 55, sound: 'prop'
+      },
+      fighter: {
+        name: '战斗机',
+        maxSpeed: 280, minSpeed: 55, accel: 35, drag: 0.0006, pitchRate: deg(80), rollRate: deg(150), yawRate: deg(45),
+        propRPMAtFull: 0, gearClearance: 1.0, spawnAlt: 45, spawnSpd: 120, sound: 'jet'
+      },
+      airliner: {
+        name: '客机',
+        maxSpeed: 235, minSpeed: 60, accel: 18, drag: 0.0013, pitchRate: deg(38), rollRate: deg(55), yawRate: deg(28),
+        propRPMAtFull: 0, gearClearance: 1.6, spawnAlt: 28, spawnSpd: 90, sound: 'turbofan'
+      }
+    };
+    function deg(x){ return THREE.MathUtils.degToRad(x); }
+
+    // 当前状态
+    let planeTypeKey = 'prop';
+    let params = {};
+    let speed = 50; // m/s
+    let verticalSpeed = 0; // m/s
+    let lastY = 0;
+    let onGround = false;
+    let overRunway = false;
+    let viewFirstPerson = false;
+
+    // 相机偏移
+    const chaseOffset = new THREE.Vector3(0, 3.0, 13);
+    const fpOffset = new THREE.Vector3(0, 0.75, -1.3);
+
+    // HUD元素
+    const elPlane = document.getElementById('planeName');
+    const elSpd = document.getElementById('spd');
+    const elAlt = document.getElementById('alt');
+    const elVS = document.getElementById('vs');
+    const elPit = document.getElementById('pit');
+    const elRol = document.getElementById('rol');
+    const elYaw = document.getElementById('yaw');
+    const elThr = document.getElementById('thrBadge');
+    const elView = document.getElementById('viewLabel');
+    const elState = document.getElementById('state');
+    const elSound = document.getElementById('soundBadge');
+    const tip = document.getElementById('centerTip');
+
+    // 键盘输入
+    const keys = {};
+    window.addEventListener('keydown', (e) => {
+      keys[e.code] = true;
+      // 初始化音频（浏览器策略）
+      maybeInitAudio();
+      // 阻止箭头滚屏
+      if (['Space','ArrowUp','ArrowDown','ArrowLeft','ArrowRight'].includes(e.code)) e.preventDefault();
+    });
+    window.addEventListener('keyup', (e) => { keys[e.code] = false; });
+
+    // 生成飞机
+    let aircraft = null;
+    function setPlaneType(key = 'prop', preservePose = false) {
+      planeTypeKey = key;
+      // 移除旧机体
+      if (aircraft) { scene.remove(aircraft); }
+      // 参数
+      const cfg = PLANE_TYPES[key];
+      params = {
+        throttle: 0.4,
+        maxSpeed: cfg.maxSpeed,
+        minSpeed: cfg.minSpeed,
+        accel: cfg.accel,
+        drag: cfg.drag,
+        pitchRate: cfg.pitchRate,
+        rollRate: cfg.rollRate,
+        yawRate: cfg.yawRate,
+        propRPMAtFull: cfg.propRPMAtFull,
+        gearClearance: cfg.gearClearance,
+        soundProfile: cfg.sound
+      };
+      // 创建机体
+      aircraft = createAirplaneMesh(key);
+      scene.add(aircraft);
+
+      // 姿态
+      if (!preservePose) {
+        speed = cfg.spawnSpd;
+        aircraft.position.set(-900, cfg.spawnAlt, 900); // 远处起飞，面向跑道
+        // 指向跑道方向（+X +Z -> 跑道朝 +X）
+        const look = new THREE.Vector3(0, 0, -1);
+        aircraft.rotation.set(0, Math.PI / 4, 0); // 朝向跑道 45°
+      }
+      onGround = false;
+      updateAudioProfile();
+      elPlane.textContent = cfg.name;
+      showTip(`已切换：${cfg.name}`);
+    }
+
+    function createAirplaneMesh(type) {
+      const g = new THREE.Group(); g.name = 'aircraft';
+      // 材质
+      const hull = new THREE.MeshStandardMaterial({ color: (type==='fighter')?0x2b6cff:(type==='airliner')?0xd23a3a:0x1f7acb, metalness: 0.55, roughness: 0.35 });
+      const accent = new THREE.MeshStandardMaterial({ color: 0xffffff, metalness: 0.3, roughness: 0.5 });
+      const dark = new THREE.MeshStandardMaterial({ color: 0x0a1b2a, metalness: 0.8, roughness: 0.25 });
+      const glass = new THREE.MeshPhysicalMaterial({ color: 0x8ad0ff, metalness: 0, roughness: 0.05, transmission: 0.7, thickness: 0.7, envMapIntensity: 1.0 });
+
+      if (type === 'prop') {
+        // 机身
+        const body = new THREE.Mesh(new THREE.CylinderGeometry(0.55, 0.65, 8, 24, 1), hull);
+        body.rotation.x = Math.PI / 2; body.castShadow = true; g.add(body);
+        const nose = new THREE.Mesh(new THREE.ConeGeometry(0.65, 1.8, 28), hull);
+        nose.rotation.x = Math.PI / 2; nose.position.z = -4.9; nose.castShadow = true; g.add(nose);
+        const tailCone = new THREE.Mesh(new THREE.ConeGeometry(0.35, 1.8, 24), hull);
+        tailCone.rotation.x = -Math.PI / 2; tailCone.position.z = 4.9; tailCone.castShadow = true; g.add(tailCone);
+        const wing = new THREE.Mesh(new THREE.BoxGeometry(12, 0.15, 1.6), accent); wing.position.set(0, 0, -0.8); wing.castShadow = true; g.add(wing);
+        const wingTipL = new THREE.Mesh(new THREE.BoxGeometry(0.1, 0.8, 1.2), hull); wingTipL.position.set(-6.05, 0.45, -0.8); wingTipL.castShadow = true;
+        const wingTipR = wingTipL.clone(); wingTipR.position.x = 6.05; g.add(wingTipL, wingTipR);
+        const hTail = new THREE.Mesh(new THREE.BoxGeometry(4.5, 0.12, 0.9), accent); hTail.position.set(0, 0.2, 3.5); hTail.castShadow = true; g.add(hTail);
+        const vTail = new THREE.Mesh(new THREE.BoxGeometry(0.1, 1.6, 1.2), hull); vTail.position.set(0, 0.9, 3.6); vTail.castShadow = true; g.add(vTail);
+        const canopy = new THREE.Mesh(new THREE.SphereGeometry(0.95, 24, 16, 0, Math.PI*2, 0, Math.PI/1.2), glass);
+        canopy.position.set(0, 0.35, -2.2); canopy.scale.set(1.0, 0.9, 1.3); canopy.castShadow = true; g.add(canopy);
+        // 螺旋桨
+        const hub = new THREE.Mesh(new THREE.CylinderGeometry(0.12, 0.12, 0.24, 16), dark); hub.rotation.x = Math.PI / 2; hub.position.z = -5.0; hub.castShadow = true;
+        const bladeGeom = new THREE.BoxGeometry(0.1, 1.8, 0.12);
+        const b1 = new THREE.Mesh(bladeGeom, dark); b1.position.set(0, 0.9, -5.0);
+        const b2 = b1.clone(); b2.rotation.z = Math.PI/2;
+        const prop = new THREE.Group(); prop.add(hub, b1, b2); g.add(prop); prop.name = 'propeller'; g.userData.prop = prop;
+        // 起落架
+        addFixedGear(g, dark);
+      } else if (type === 'fighter') {
+        // 细长机身
+        const body = new THREE.Mesh(new THREE.CapsuleGeometry(0.6, 6.5, 12, 24), hull);
+        body.rotation.x = Math.PI / 2; body.castShadow = true; g.add(body);
+        // 尖鼻
+        const nose = new THREE.Mesh(new THREE.ConeGeometry(0.65, 2.2, 28), hull);
+        nose.rotation.x = Math.PI / 2; nose.position.z = -4.7; g.add(nose);
+        // 进气口
+        const intakeL = new THREE.Mesh(new THREE.TorusGeometry(0.38, 0.09, 12, 28), dark);
+        intakeL.rotation.x = Math.PI / 2; intakeL.position.set(-0.6, -0.2, -3.6);
+        const intakeR = intakeL.clone(); intakeR.position.x = 0.6; g.add(intakeL, intakeR);
+        // 后喷口
+        const nozzle = new THREE.Mesh(new THREE.CylinderGeometry(0.45, 0.55, 0.9, 24, 1, true), dark);
+        nozzle.rotation.x = Math.PI / 2; nozzle.position.z = 4.5; g.add(nozzle);
+        // 机翼（后掠）
+        const wing = new THREE.Mesh(new THREE.BoxGeometry(10, 0.12, 1.2), accent);
+        wing.position.set(0, -0.05, -0.6); wing.rotation.y = deg(8); wing.castShadow = true; g.add(wing);
+        // 尾翼
+        const hTail = new THREE.Mesh(new THREE.BoxGeometry(4.2, 0.12, 0.8), accent); hTail.position.set(0, 0.05, 3.2); hTail.rotation.y = deg(-6); g.add(hTail);
+        const vTail = new THREE.Mesh(new THREE.BoxGeometry(0.12, 1.8, 1.0), hull); vTail.position.set(0, 0.9, 3.1); g.add(vTail);
+        // 座舱盖
+        const canopy = new THREE.Mesh(new THREE.SphereGeometry(0.8, 24, 16, 0, Math.PI*2, 0, Math.PI/1.6), glass);
+        canopy.position.set(0, 0.35, -1.2); canopy.scale.set(1.0, 0.85, 1.1); g.add(canopy);
+        addFixedGear(g, dark, 1.0);
+      } else if (type === 'airliner') {
+        // 粗圆机身
+        const body = new THREE.Mesh(new THREE.CylinderGeometry(1.3, 1.35, 16, 28), hull);
+        body.rotation.x = Math.PI / 2; body.castShadow = true; g.add(body);
+        const nose = new THREE.Mesh(new THREE.SphereGeometry(1.35, 28, 20), hull);
+        nose.scale.set(1, 1, 1.2); nose.position.z = -8; g.add(nose);
+        const tailCone = new THREE.Mesh(new THREE.ConeGeometry(0.8, 3.2, 24), hull);
+        tailCone.rotation.x = -Math.PI / 2; tailCone.position.z = 8.5; g.add(tailCone);
+        // 机翼
+        const wing = new THREE.Mesh(new THREE.BoxGeometry(18, 0.18, 2.2), accent);
+        wing.position.set(0, -0.2, -0.6); wing.castShadow = true; g.add(wing);
+        const wingletL = new THREE.Mesh(new THREE.BoxGeometry(0.16, 1.2, 1.4), hull);
+        wingletL.position.set(-9.1, 0.6, -0.6); const wingletR = wingletL.clone(); wingletR.position.x = 9.1; g.add(wingletL, wingletR);
+        // 发动机吊舱（双发）
+        const nacelleGeom = new THREE.CylinderGeometry(0.7, 0.75, 2.0, 24);
+        const nac1 = new THREE.Mesh(nacelleGeom, dark); nac1.rotation.z = Math.PI / 2; nac1.position.set(-4.3, -0.9, -0.8);
+        const nac2 = nac1.clone(); nac2.position.x = 4.3; g.add(nac1, nac2);
+        // 尾翼
+        const hTail = new THREE.Mesh(new THREE.BoxGeometry(7.5, 0.16, 1.6), accent); hTail.position.set(0, 0.4, 6.4); g.add(hTail);
+        const vTail = new THREE.Mesh(new THREE.BoxGeometry(0.2, 3.0, 1.8), hull); vTail.position.set(0, 1.5, 6.8); g.add(vTail);
+        // 舷窗（点阵）
+        const winGeom = new THREE.CircleGeometry(0.09, 12);
+        for (let i = -8; i <= 8; i++) {
+          const w = new THREE.Mesh(winGeom, new THREE.MeshBasicMaterial({ color: 0x111111 }));
+          w.position.set(0.0, 0.3 + 0.1 * Math.sin(i*0.2), i * -0.9);
+          w.rotation.y = Math.PI / 2; g.add(w);
+        }
+        addFixedGear(g, dark, 1.6, true);
+      }
+      // 初始朝向：机头指向 -Z
+      g.rotation.set(0, Math.PI, 0);
+      return g;
+    }
+
+    function addFixedGear(g, mat, clearance = 1.2, dualMain = false) {
+      const noseStrut = new THREE.Mesh(new THREE.CylinderGeometry(0.08, 0.08, 0.8, 12), mat);
+      noseStrut.position.set(0, -clearance + 0.4, -3.6);
+      const wheel = new THREE.Mesh(new THREE.TorusGeometry(0.24, 0.08, 10, 18), mat); wheel.rotation.x = Math.PI/2; wheel.position.set(0, -clearance, -3.6);
+      const mainL = noseStrut.clone(); mainL.position.set(-1.6, -clearance + 0.4, -0.6);
+      const mainR = mainL.clone(); mainR.position.x = 1.6;
+      const wheelL = wheel.clone(); wheelL.position.set(-1.6, -clearance, -0.6);
+      const wheelR = wheel.clone(); wheelR.position.set(1.6, -clearance, -0.6);
+      [noseStrut, wheel, mainL, mainR, wheelL, wheelR].forEach(m => { m.castShadow = true; g.add(m); });
+      if (dualMain) {
+        const add = (x, z) => { const w = wheel.clone(); w.position.set(x, -clearance, z); g.add(w); };
+        add(-2.0, -0.9); add(2.0, -0.9);
+      }
+    }
+
+    // HUD更新
+    function updateHUD() {
+      elSpd.textContent = Math.round(speed * 3.6);
+      elAlt.textContent = Math.max(0, Math.round(aircraft.position.y));
+      elVS.textContent = verticalSpeed.toFixed(1);
+      const e = new THREE.Euler().setFromQuaternion(aircraft.quaternion, 'ZYX');
+      const roll = THREE.MathUtils.radToDeg(e.z);
+      const pitch = THREE.MathUtils.radToDeg(e.x);
+      const yaw = THREE.MathUtils.radToDeg(e.y);
+      elPit.textContent = Math.round(pitch);
+      elRol.textContent = Math.round(roll);
+      elYaw.textContent = Math.round((yaw + 360) % 360);
+      elThr.textContent = `油门 ${Math.round(params.throttle * 100)}%`;
+      elView.textContent = viewFirstPerson ? '第一人称' : '第三人称';
+      elState.textContent = onGround ? (overRunway ? '跑道滑行' : '地面滑行') : '空中';
+    }
+
+    function showTip(text = '提示', time = 1100) {
+      tip.textContent = text; tip.style.opacity = 1;
+      clearTimeout(showTip._t); showTip._t = setTimeout(() => tip.style.opacity = 0, time);
+    }
+
+    function resetAircraft() {
+      const cfg = PLANE_TYPES[planeTypeKey];
+      aircraft.position.set(-900, cfg.spawnAlt, 900);
+      aircraft.rotation.set(0, Math.PI/4, 0);
+      speed = cfg.spawnSpd;
+      params.throttle = 0.45;
+      onGround = false;
+      showTip('已重置');
+    }
+
+    // 输入
+    function handleInput(dt) {
+      // 机型切换
+      if (keys.Digit1 && !handleInput._l1) { setPlaneType('prop'); handleInput._l1 = true; setTimeout(()=>handleInput._l1=false,200); }
+      if (keys.Digit2 && !handleInput._l2) { setPlaneType('fighter'); handleInput._l2 = true; setTimeout(()=>handleInput._l2=false,200); }
+      if (keys.Digit3 && !handleInput._l3) { setPlaneType('airliner'); handleInput._l3 = true; setTimeout(()=>handleInput._l3=false,200); }
+
+      // 声音开关
+      if (keys.KeyM && !handleInput._lm) {
+        audioEnabled = !audioEnabled; updateAudioEnabled();
+        handleInput._lm = true; setTimeout(()=>handleInput._lm=false,200);
+      }
+
+      // 视角
+      if (keys.KeyV && !handleInput._lv) {
+        viewFirstPerson = !viewFirstPerson;
+        handleInput._lv = true; setTimeout(()=>handleInput._lv=false,220);
+      }
+      // 重置
+      if (keys.KeyR && !handleInput._lr) {
+        resetAircraft();
+        handleInput._lr = true; setTimeout(()=>handleInput._lr=false,220);
+      }
+
+      // 油门
+      if (keys.ShiftLeft || keys.ShiftRight) params.throttle = Math.min(1, params.throttle + 0.7 * dt);
+      if (keys.ControlLeft || keys.ControlRight) params.throttle = Math.max(0, params.throttle - 0.7 * dt);
+
+      // 姿态（空中时更敏感，地面时限制）
+      const groundFactor = onGround ? 0.35 : 1.0;
+      const pitchIn = ((keys.KeyS || keys.ArrowDown) ? 1 : 0) - ((keys.KeyW || keys.ArrowUp) ? 1 : 0);
+      const rollIn = ((keys.KeyD || keys.ArrowRight) ? 1 : 0) - ((keys.KeyA || keys.ArrowLeft) ? 1 : 0);
+      const yawIn = ((keys.KeyE) ? 1 : 0) - ((keys.KeyQ) ? 1 : 0);
+
+      aircraft.rotateX(pitchIn * params.pitchRate * dt * groundFactor);
+      aircraft.rotateZ(-rollIn * params.rollRate * dt * groundFactor);
+      aircraft.rotateY(yawIn * params.yawRate * dt * (onGround ? 0.6 : 1.0)); // 地面方向舵弱一点
+
+      // 地面自动纠正（避免机翼刮地）
+      if (onGround) {
+        // 自动回正滚转和俯仰
+        const worldUp = new THREE.Vector3(0,1,0);
+        const right = new THREE.Vector3(1,0,0).applyQuaternion(aircraft.quaternion);
+        const forward = new THREE.Vector3(0,0,-1).applyQuaternion(aircraft.quaternion);
+        // 让 right 尽量水平
+        const bank = right.y; aircraft.rotateZ(-bank * 2.5 * dt);
+        // 让俯仰略微回正
+        const nose = forward.y; aircraft.rotateX(-nose * 1.8 * dt);
+      }
+    }
+
+    // 简化飞行 & 着陆/滑行
+    function updateFlight(dt) {
+      // 目标速度（推力）
+      const targetSpeed = params.throttle * params.maxSpeed;
+      const drag = params.drag * speed * speed;
+      const accel = Math.sign(targetSpeed - speed) * params.accel - drag;
+      // 地面刹车/摩擦
+      const braking = (onGround && (keys.Space || keys.ShiftLeft || keys.ShiftRight)) ? 0.9 : 0.0;
+      const groundFriction = onGround ? (0.8 + braking) : 0.0;
+      speed = Math.max(0, speed + (accel - groundFriction) * dt);
+
+      // 按机体前向推进
+      const forward = new THREE.Vector3(0, 0, -1).applyQuaternion(aircraft.quaternion);
+      const prevY = aircraft.position.y;
+      aircraft.position.addScaledVector(forward, speed * dt);
+      // 高度约束
+      const groundY = 0;
+      const minY = groundY + params.gearClearance;
+      if (aircraft.position.y < minY) {
+        aircraft.position.y = minY;
+      }
+      verticalSpeed = (aircraft.position.y - prevY) / dt;
+
+      // 接地检测
+      const wasGround = onGround;
+      onGround = aircraft.position.y <= minY + 0.001;
+      // 是否在跑道投影内
+      overRunway = pointOverRunway(aircraft.position);
+
+      // 触地事件
+      if (!wasGround && onGround) {
+        const vs = -verticalSpeed; // 向下为正
+        const kph = speed * 3.6;
+        if (overRunway && vs < 1.5 && kph < 260) {
+          showTip('接地良好 ✅');
+        } else if (vs < 2.5 && kph < 300) {
+          showTip('硬着陆 ⚠️');
+        } else {
+          showTip('剧烈接地！❌'); // 如果过快
+        }
+        playTouchdown(vs);
+      }
+      // 地面时，限制俯仰抬头角度，避免起飞角过大
+      if (onGround) {
+        // 若在跑道上，轻微自动对正跑道方向
+        if (overRunway) {
+          const runwayDir = new THREE.Vector3(1,0,0); // 跑道朝 +X
+          const currentFwd = forward.clone().setY(0).normalize();
+          const sign = Math.sign(currentFwd.cross(runwayDir).y);
+          const angle = Math.acos(THREE.MathUtils.clamp(currentFwd.dot(runwayDir), -1, 1));
+          aircraft.rotateY(-sign * Math.min(angle, deg(30)) * 0.6 * dt);
+        }
+      }
+
+      // 螺旋桨旋转
+      const prop = aircraft.userData.prop;
+      if (prop && params.propRPMAtFull > 0) {
+        const rpm = params.propRPMAtFull * (0.2 + 0.8 * params.throttle);
+        prop.rotation.z -= (rpm / 60) * 2 * Math.PI * dt;
+      }
+    }
+
+    function pointOverRunway(pos) {
+      // 跑道沿 X 轴铺设
+      const localX = pos.x - runway.position.x;
+      const localZ = pos.z - runway.position.z;
+      const halfL = runway.userData.length/2, halfW = runway.userData.width/2;
+      return (localX > -halfL && localX < halfL && localZ > -halfW && localZ < halfW);
+    }
+
+    // 相机跟随
+    function updateCamera(dt) {
+      if (viewFirstPerson) {
+        const local = fpOffset.clone();
+        const world = local.applyMatrix4(aircraft.matrixWorld);
+        camera.position.lerp(world, 0.45);
+        const lookAt = new THREE.Vector3(0, 0, -10).applyQuaternion(aircraft.quaternion).add(aircraft.position);
+        camera.lookAt(lookAt);
+        camera.near = 0.02; camera.far = 20000; camera.updateProjectionMatrix();
+      } else {
+        const local = chaseOffset.clone();
+        const world = local.applyMatrix4(aircraft.matrixWorld);
+        camera.position.lerp(world, 0.08);
+        const lookAt = new THREE.Vector3(0, 0, -18).applyQuaternion(aircraft.quaternion).add(aircraft.position);
+        camera.lookAt(lookAt);
+        camera.near = 0.1; camera.far = 20000; camera.updateProjectionMatrix();
+      }
+    }
+
+    // 音频（WebAudio 纯程序音）
+    let audioCtx = null, masterGain = null, engineGain = null, engineNode = null, windGain = null, windNode = null;
+    let audioEnabled = false;
+
+    function maybeInitAudio() {
+      if (audioCtx) return;
+      try {
+        audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+        masterGain = audioCtx.createGain(); masterGain.gain.value = 0.0; masterGain.connect(audioCtx.destination);
+        // 引擎
+        engineGain = audioCtx.createGain(); engineGain.gain.value = 0.0; engineGain.connect(masterGain);
+        // 风噪
+        windGain = audioCtx.createGain(); windGain.gain.value = 0.0; windGain.connect(masterGain);
+        windNode = createNoiseNode(); windNode.connect(windGain);
+        windNode.start();
+        updateAudioProfile();
+        audioEnabled = true; updateAudioEnabled();
+        showTip('声音已启用（M可开关）', 1400);
+      } catch (e) {
+        console.warn('Audio init failed', e);
+      }
+    }
+
+    function updateAudioEnabled() {
+      if (!masterGain) return;
+      masterGain.gain.setTargetAtTime(audioEnabled ? 1.0 : 0.0, audioCtx.currentTime, 0.08);
+      elSound.textContent = `声音 ${audioEnabled ? '开' : '关'}`;
+    }
+
+    function createNoiseNode() {
+      const bufferSize = 2 * (audioCtx.sampleRate || 48000);
+      const buffer = audioCtx.createBuffer(1, bufferSize, audioCtx.sampleRate);
+      const data = buffer.getChannelData(0);
+      for (let i=0;i<bufferSize;i++) data[i] = Math.random()*2-1;
+      const src = audioCtx.createBuffer
